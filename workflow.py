@@ -13,7 +13,7 @@ Run: python workflow.py
 
 import asyncio
 import json
-from typing import Dict, List, Optional, Any, Callable, Literal
+from typing import Dict, List, Optional, Any, Callable, Literal, Awaitable
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
@@ -44,6 +44,7 @@ class WorkflowStep:
     required_inputs: List[str] = field(default_factory=list)
     condition: Optional[Callable] = None  # Skip if condition returns False
     retry_count: int = 2
+    handler: Optional[Callable[["WorkflowContext"], Awaitable[Any]]] = None
 
     # Runtime state
     status: StepStatus = StepStatus.PENDING
@@ -94,13 +95,19 @@ class WorkflowOrchestrator:
     def add_step(
         self,
         name: str,
-        agent: Agent,
-        prompt_template: str,
+        agent: Optional[Agent] = None,
+        prompt_template: str = "",
         required_inputs: List[str] = None,
         condition: Callable = None,
         retry_count: int = 2,
+        handler: Optional[Callable[[WorkflowContext], Awaitable[Any]]] = None,
     ):
         """Add a step to the workflow."""
+        if handler is None and (agent is None or not prompt_template):
+            raise ValueError(
+                "Step requires either a custom handler or both agent and prompt_template"
+            )
+
         step = WorkflowStep(
             name=name,
             agent=agent,
@@ -108,6 +115,7 @@ class WorkflowOrchestrator:
             required_inputs=required_inputs or [],
             condition=condition,
             retry_count=retry_count,
+            handler=handler,
         )
         self.steps.append(step)
         return self
@@ -194,7 +202,15 @@ class WorkflowOrchestrator:
         bare ``KeyError``. The except branch below converts that into
         a diagnostic naming both the step and the missing key.
         """
-        # YOUR CODE HERE
+        if step.handler is not None:
+            result = await step.handler(self.context)
+            normalized = self._normalize_step_result(result)
+            self.context.set(f"step_{step.name}_result", normalized)
+            return normalized
+
+        if step.agent is None:
+            raise ValueError(f"Step '{step.name}' has no agent configured")
+
         try:
             prompt = step.prompt_template.format(**self.context.data)
         except KeyError as e:
@@ -207,6 +223,14 @@ class WorkflowOrchestrator:
         result = await step.agent.run(prompt)
         self.context.set(f"step_{step.name}_result", result.output)
         return result.output
+
+    def _normalize_step_result(self, result: Any) -> str:
+        """Normalize arbitrary step output into a string for consistent storage."""
+        if isinstance(result, str):
+            return result
+        if result is None:
+            return ""
+        return json.dumps(result, ensure_ascii=True)
 
     def _get_results(self) -> Dict[str, Any]:
         """Get workflow results."""
@@ -487,6 +511,117 @@ async def dynamic_factory_workflow_example():
         print("\n" + "-" * 60 + "\n")
 
 
+async def nested_subworkflow_example():
+    """Demonstrate a parent step invoking a child workflow as a single step."""
+    model_name = os.getenv("AI_MODEL", "openai:gpt-5.4-mini")
+    planner_agent = Agent(
+        model_name,
+        system_prompt="You create concise execution artifacts.",
+    )
+    reviewer_agent = Agent(
+        model_name,
+        system_prompt="You identify key risks and mitigations.",
+    )
+
+    parent_workflow = WorkflowOrchestrator("Parent Workflow With Sub-Workflow Step")
+
+    parent_workflow.add_step(
+        name="intake_request",
+        agent=planner_agent,
+        prompt_template="Extract delivery objective and constraints from: {task_input}",
+        required_inputs=["task_input"],
+    )
+
+    async def run_child_workflow(ctx: WorkflowContext) -> Dict[str, Any]:
+        child = WorkflowOrchestrator("Child Workflow: Plan + Risk")
+        child.add_step(
+            name="build_plan",
+            agent=planner_agent,
+            prompt_template=(
+                "Create an actionable plan from this request context:\n\n"
+                "{step_intake_request_result}"
+            ),
+            required_inputs=["step_intake_request_result"],
+        )
+        child.add_step(
+            name="assess_risks",
+            agent=reviewer_agent,
+            prompt_template=(
+                "Assess top risks and mitigations for this plan:\n\n"
+                "{step_build_plan_result}"
+            ),
+            required_inputs=["step_build_plan_result"],
+        )
+
+        child_results = await child.execute(
+            initial_data={"step_intake_request_result": ctx.get("step_intake_request_result")}
+        )
+
+        # Merge selected child outputs under one parent key.
+        merged_child_data = {
+            "status": child_results["status"],
+            "plan": child_results["context"].get("step_build_plan_result"),
+            "risks": child_results["context"].get("step_assess_risks_result"),
+            "duration_seconds": child_results.get("duration_seconds"),
+        }
+        ctx.set("child_workflow", merged_child_data)
+
+        if child_results["status"] != "completed":
+            failed_steps = [
+                step["name"]
+                for step in child_results["steps"]
+                if step["status"] == "failed"
+            ]
+            partial = {
+                "status": "partial",
+                "failed_steps": failed_steps,
+                "child_workflow": merged_child_data,
+            }
+
+            # Failure policy:
+            # - default: raise to fail parent step (and allow parent retries)
+            # - allow_child_partial=True: record partial output and continue
+            if ctx.get("allow_child_partial", False):
+                return partial
+
+            raise RuntimeError(
+                f"Child workflow failed in steps: {failed_steps or ['unknown']}"
+            )
+
+        return {
+            "status": "completed",
+            "child_workflow": merged_child_data,
+        }
+
+    parent_workflow.add_step(
+        name="run_child_workflow",
+        required_inputs=["step_intake_request_result"],
+        retry_count=1,
+        handler=run_child_workflow,
+    )
+
+    parent_workflow.add_step(
+        name="finalize_response",
+        agent=planner_agent,
+        prompt_template=(
+            "Create final delivery using this parent context data:\n\n"
+            "Child summary: {child_workflow}\n\n"
+            "Child execution result: {step_run_child_workflow_result}"
+        ),
+        required_inputs=["child_workflow", "step_run_child_workflow_result"],
+    )
+
+    results = await parent_workflow.execute(
+        initial_data={
+            "task_input": "Build a rollout plan for a support chatbot with key risks.",
+            "allow_child_partial": False,
+        }
+    )
+
+    print("Nested Workflow Results:")
+    print(json.dumps(results, indent=2))
+
+
 async def main():
     """Main demonstration."""
     print("Workflow Orchestration Examples\n")
@@ -500,6 +635,10 @@ async def main():
     print("\n" + "=" * 60 + "\n")
 
     await dynamic_factory_workflow_example()
+
+    print("\n" + "=" * 60 + "\n")
+
+    await nested_subworkflow_example()
 
 
 if __name__ == "__main__":
