@@ -13,7 +13,7 @@ Run: python workflow.py
 
 import asyncio
 import json
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Literal
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
@@ -238,6 +238,129 @@ class WorkflowOrchestrator:
         }
 
 
+TaskCategory = Literal["research", "execution"]
+
+
+def classify_task(task_input: str) -> TaskCategory:
+    """Classify a task into a workflow category.
+
+    This is intentionally lightweight and rule-based so the factory can
+    select a step graph before any expensive agent calls run.
+    """
+    text = task_input.lower()
+
+    research_keywords = {
+        "research",
+        "analyze",
+        "analysis",
+        "compare",
+        "trend",
+        "report",
+        "study",
+        "market",
+        "findings",
+    }
+    execution_keywords = {
+        "build",
+        "implement",
+        "create",
+        "deploy",
+        "fix",
+        "plan",
+        "launch",
+        "workflow",
+        "checklist",
+    }
+
+    research_score = sum(1 for keyword in research_keywords if keyword in text)
+    execution_score = sum(1 for keyword in execution_keywords if keyword in text)
+
+    # Longer inputs are often exploratory and benefit from research synthesis.
+    if len(task_input.split()) >= 20:
+        research_score += 1
+
+    return "research" if research_score >= execution_score else "execution"
+
+
+def build_workflow_factory(category: TaskCategory) -> WorkflowOrchestrator:
+    """Create a WorkflowOrchestrator with category-specific steps."""
+    model_name = os.getenv("AI_MODEL", "openai:gpt-5.4-mini")
+
+    analyst_agent = Agent(
+        model_name,
+        system_prompt="You analyze requests and identify key requirements.",
+    )
+    researcher_agent = Agent(
+        model_name,
+        system_prompt="You gather and structure high-value research insights.",
+    )
+    planner_agent = Agent(
+        model_name,
+        system_prompt="You create actionable plans and clear deliverables.",
+    )
+
+    workflow = WorkflowOrchestrator(f"Dynamic Workflow ({category})")
+
+    if category == "research":
+        workflow.add_step(
+            name="scope_question",
+            agent=analyst_agent,
+            prompt_template=(
+                "Scope this research request and list the main questions: {task_input}"
+            ),
+            required_inputs=["task_input"],
+        )
+
+        workflow.add_step(
+            name="collect_findings",
+            agent=researcher_agent,
+            prompt_template=(
+                "Generate key factual findings for this scope:\n\n{step_scope_question_result}"
+            ),
+            required_inputs=["step_scope_question_result"],
+        )
+
+        workflow.add_step(
+            name="synthesize_brief",
+            agent=planner_agent,
+            prompt_template=(
+                "Create a concise research brief with recommendations:\n\n"
+                "{step_collect_findings_result}"
+            ),
+            required_inputs=["step_collect_findings_result"],
+        )
+    else:
+        workflow.add_step(
+            name="extract_requirements",
+            agent=analyst_agent,
+            prompt_template="Extract concrete requirements from: {task_input}",
+            required_inputs=["task_input"],
+        )
+
+        workflow.add_step(
+            name="build_action_plan",
+            agent=planner_agent,
+            prompt_template=(
+                "Create a step-by-step execution plan from these requirements:\n\n"
+                "{step_extract_requirements_result}"
+            ),
+            required_inputs=["step_extract_requirements_result"],
+        )
+
+        workflow.add_step(
+            name="draft_deliverable",
+            agent=planner_agent,
+            prompt_template=(
+                "Draft a delivery-ready response for this request:\n\n"
+                "Original task: {task_input}\n\n"
+                "Plan:\n{step_build_action_plan_result}"
+            ),
+            required_inputs=["task_input", "step_build_action_plan_result"],
+        )
+
+    return workflow
+
+
 # Example: Research workflow
 async def research_workflow_example():
     """Demonstrate multi-step research workflow."""
@@ -329,6 +452,41 @@ async def conditional_workflow_example():
     results = await workflow.execute(initial_data={"order": "Book x2, $29.99"})
 
 
+async def dynamic_factory_workflow_example():
+    """Demonstrate dynamic workflow construction from task classification."""
+    demo_inputs = [
+        "Research emerging trends in edge AI for healthcare diagnostics and summarize findings.",
+        "Create a launch checklist and implementation plan for deploying a customer support chatbot.",
+    ]
+
+    print("Dynamic Workflow Factory Demo\n")
+
+    for idx, task_input in enumerate(demo_inputs, start=1):
+        category = classify_task(task_input)
+        workflow = build_workflow_factory(category)
+
+        print(f"Scenario {idx}")
+        print(f"Input: {task_input}")
+        print(f"Classified category: {category}")
+        print(f"Step sequence: {[step.name for step in workflow.steps]}\n")
+
+        results = await workflow.execute(
+            initial_data={
+                "task_input": task_input,
+                "task_category": category,
+            }
+        )
+
+        executed_path = [
+            step["name"]
+            for step in results["steps"]
+            if step["status"] in ("completed", "running")
+        ]
+        print(f"Executed path: {executed_path}")
+        print(f"Workflow status: {results['status']}")
+        print("\n" + "-" * 60 + "\n")
+
+
 async def main():
     """Main demonstration."""
     print("Workflow Orchestration Examples\n")
@@ -338,6 +496,10 @@ async def main():
     print("\n" + "=" * 60 + "\n")
 
     await conditional_workflow_example()
+
+    print("\n" + "=" * 60 + "\n")
+
+    await dynamic_factory_workflow_example()
 
 
 if __name__ == "__main__":
