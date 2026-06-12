@@ -115,20 +115,8 @@ class WorkflowOrchestrator:
     async def execute(self, initial_data: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Execute the complete workflow.
-
-        This orchestration loop is provided for you. It handles:
-        - Seeding the shared context with initial_data
-        - Iterating steps in order and printing progress banners
-        - Skipping steps whose condition returns False
-        - Validating that each step's required_inputs are present
-        - Retrying a step up to retry_count + 1 times on failure
-        - Recording final status, errors, and total duration
-
-        It calls self._execute_step(step) to actually run each step — that
-        is the method you will implement.
         """
-        # Initialize context
-        if initial_data:
+        if initial_data is not None:
             self.context.data.update(initial_data)
 
         self.context.start_time = datetime.now()
@@ -143,54 +131,45 @@ class WorkflowOrchestrator:
             print(f"{'─'*60}")
 
             try:
-                # Check condition
+                # Skip when condition exists and returns False.
                 if step.condition and not step.condition(self.context):
                     step.status = StepStatus.SKIPPED
                     print(f"⊘ Skipped (condition not met)\n")
                     continue
 
-                # Check required inputs
+                # Validate all required inputs exist in shared context.
                 missing = [
                     inp for inp in step.required_inputs if not self.context.has(inp)
                 ]
                 if missing:
                     raise ValueError(f"Missing required inputs: {missing}")
 
-                # Execute step with retries
                 step.status = StepStatus.RUNNING
-                success = False
 
                 for attempt in range(step.retry_count + 1):
-                    step.attempts = attempt + 1
+                    step.attempts += 1
 
                     try:
                         result = await self._execute_step(step)
                         step.result = result
                         step.status = StepStatus.COMPLETED
                         self.context.steps_completed.append(step.name)
-                        success = True
                         print(f"✓ Completed (attempt {attempt + 1})\n")
                         break
 
                     except Exception as e:
                         if attempt < step.retry_count:
                             print(f"⚠ Attempt {attempt + 1} failed: {e}")
-                            print(f"  Retrying...")
+                            print("  Retrying...")
                             await asyncio.sleep(1)
                         else:
                             raise
-
-                if not success:
-                    raise RuntimeError(
-                        f"Step failed after {step.retry_count + 1} attempts"
-                    )
 
             except Exception as e:
                 step.status = StepStatus.FAILED
                 step.error = str(e)
                 print(f"✗ Failed: {e}\n")
 
-                # Stop workflow on failure
                 self.context.end_time = datetime.now()
                 return self._get_results()
 
